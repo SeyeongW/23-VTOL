@@ -106,3 +106,55 @@ PARAM_DEFINE_FLOAT(VT_B_TRANS_RAMP, 3.0f);
  * @group VTOL Attitude Control
  */
 PARAM_DEFINE_FLOAT(VT_PSHER_SLEW, 0.33f);
+
+/**
+ * Minimum airspeed required to transition to fixed-wing
+ *
+ * This sets the required airspeed for initiating the MC → FW transition.
+ *
+ * @unit m/s
+ * @min 0.0
+ * @max 50.0
+ * @decimal 1
+ * @group VTOL Attitude Control
+ */
+PARAM_DEFINE_FLOAT(VT_TRANS_AIRSPEED, 15.0f);
+
+/**
+ * Maximum allowable acceleration during transition
+ *
+ * Limits acceleration (in m/s^2) permitted during transition to fixed-wing.
+ *
+ * @unit m/s^2
+ * @min 0.0
+ * @max 10.0
+ * @decimal 2
+ * @group VTOL Attitude Control
+ */
+PARAM_DEFINE_FLOAT(VT_TRANS_MAX_ACC, 2.94f);
+
+/**
+ * Minimum altitude required for transition
+ *
+ * Prevents transition if altitude is below threshold.
+ *
+ * @unit m
+ * @min 0.0
+ * @max 100.0
+ * @decimal 1
+ * @group VTOL Attitude Control
+ */
+PARAM_DEFINE_FLOAT(VT_TRANS_MIN_ALT, 10.0f);
+
+/**
+ * Maximum allowed descent during transition
+ *
+ * Prevents transition if vertical drop since takeoff exceeds threshold.
+ *
+ * @unit m
+ * @min 0.0
+ * @max 10.0
+ * @decimal 1
+ * @group VTOL Attitude Control
+ */
+PARAM_DEFINE_FLOAT(VT_TRANS_DROP_MAX, 2.0f);
