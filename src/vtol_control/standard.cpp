@@ -53,6 +53,36 @@ Standard::Standard(VtolAttitudeControl *attc) :
 {
 }
 
+bool Standard::check_transition_conditions()
+{
+	// load defined transition limits
+	_aspd_trans_min = _param_trans_aspd.get();
+	_accel_trans_max = _param_trans_acc.get();
+	_alt_trans_min = _param_trans_alt.get();
+	_drop_trans_max = _param_trans_drop.get();
+
+	// read current sensor values
+	const float airspeed = _airspeed_validated->calibrated_airspeed_m_s;
+	const float accel_mag = _accel.xyz.norm();
+	const float altitude = -_local_pos->z;  // PX4 Z-axis increases downward
+	const float vertical_drop = math::max(_takeoff_altitude - _local_pos->z, 0.0f);
+
+	// check all constraints
+	const bool speed_ok = PX4_ISFINITE(airspeed) && airspeed >= _aspd_trans_min;
+	const bool accel_ok = accel_mag <= _accel_trans_max;
+	const bool alt_ok = _local_pos->z_valid && altitude >= _alt_trans_min;
+	const bool drop_ok = vertical_drop <= _drop_trans_max;
+
+	const bool transition_allowed = speed_ok && accel_ok && alt_ok && drop_ok;
+
+	PX4_INFO("[%s]transition %s : airspeed: %.2f m/s, accel: %.2f m/s^2, altitude: %.2f m, drop: %.2f m",
+			_vtol_mode == vtol_mode::TRANSITION_TO_FW ? "MC->FC" : "FW->MC",
+			transition_allowed ? "allowed" : "not allowed",
+			airspeed, accel_mag, altitude, vertical_drop);
+
+	return transition_allowed;
+}
+
 void
 Standard::parameters_update()
 {
@@ -72,73 +102,48 @@ void Standard::update_vtol_state()
 	float mc_weight = _mc_roll_weight;
 
 	if (_vtol_vehicle_status->fixed_wing_system_failure) {
-		// Failsafe event, engage mc motors immediately
 		_vtol_mode = vtol_mode::MC_MODE;
 		_pusher_throttle = 0.0f;
-
+	
 	} else if (!_attc->is_fixed_wing_requested()) {
-
-		// the transition to fw mode switch is off
-		if (_vtol_mode == vtol_mode::MC_MODE) {
-			// in mc mode
-			_vtol_mode = vtol_mode::MC_MODE;
-			mc_weight = 1.0f;
-
-		} else if (_vtol_mode == vtol_mode::FW_MODE) {
-			// Regular backtransition
+		// BACK TRANSITION (FW → MC)
+		if (_vtol_mode == vtol_mode::FW_MODE) {
 			resetTransitionStates();
 			_vtol_mode = vtol_mode::TRANSITION_TO_MC;
-
-		} else if (_vtol_mode == vtol_mode::TRANSITION_TO_FW) {
-			// failsafe back to mc mode
-			_vtol_mode = vtol_mode::MC_MODE;
-			mc_weight = 1.0f;
-			_pusher_throttle = 0.0f;
-
+	
 		} else if (_vtol_mode == vtol_mode::TRANSITION_TO_MC) {
-			// speed exit condition: use ground if valid, otherwise airspeed
-			bool exit_backtransition_speed_condition = false;
-
-			if (_local_pos->v_xy_valid) {
-				const Dcmf R_to_body(Quatf(_v_att->q).inversed());
-				const Vector3f vel = R_to_body * Vector3f(_local_pos->vx, _local_pos->vy, _local_pos->vz);
-				exit_backtransition_speed_condition = vel(0) < _param_mpc_xy_cruise.get();
-
-			} else if (PX4_ISFINITE(_airspeed_validated->calibrated_airspeed_m_s)) {
-				exit_backtransition_speed_condition = _airspeed_validated->calibrated_airspeed_m_s < _param_mpc_xy_cruise.get();
-			}
-
-			const bool exit_backtransition_time_condition = _time_since_trans_start > _param_vt_b_trans_dur.get();
-
-			if (can_transition_on_ground() || exit_backtransition_speed_condition || exit_backtransition_time_condition) {
+			if (can_transition_on_ground() || check_transition_conditions()) {
 				_vtol_mode = vtol_mode::MC_MODE;
 			}
 		}
-
+	
 	} else {
-		// the transition to fw mode switch is on
+		// FRONT TRANSITION (MC → FW)
 		if (_vtol_mode == vtol_mode::MC_MODE || _vtol_mode == vtol_mode::TRANSITION_TO_MC) {
-			// start transition to fw mode
-			/* NOTE: The failsafe transition to fixed-wing was removed because it can result in an
-			 * unsafe flying state. */
-			resetTransitionStates();
-			_vtol_mode = vtol_mode::TRANSITION_TO_FW;
-
+	
+			// Only once: store takeoff reference altitude
+			if (!_takeoff_altitude_set && _local_pos->z_valid) {
+				_takeoff_altitude = _local_pos->z;
+				_takeoff_altitude_set = true;
+			}
+	
+			if (check_transition_conditions()) {
+				resetTransitionStates();
+				_vtol_mode = vtol_mode::TRANSITION_TO_FW;
+			}
+	
 		} else if (_vtol_mode == vtol_mode::FW_MODE) {
-			// in fw mode
 			_vtol_mode = vtol_mode::FW_MODE;
 			mc_weight = 0.0f;
-
+	
 		} else if (_vtol_mode == vtol_mode::TRANSITION_TO_FW) {
-
 			if (isFrontTransitionCompleted()) {
 				_vtol_mode = vtol_mode::FW_MODE;
-
-				// don't set pusher throttle here as it's being ramped up elsewhere
 				_trans_finished_ts = hrt_absolute_time();
 			}
 		}
 	}
+	
 
 	_mc_roll_weight = mc_weight;
 	_mc_pitch_weight = mc_weight;
