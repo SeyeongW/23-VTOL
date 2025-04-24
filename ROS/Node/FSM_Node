@@ -1,0 +1,111 @@
+import rclpy
+from rclpy.node import Node
+from px4_msgs.msg import VehicleOdometry, VehicleCommand
+from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint
+import math
+
+class FSMNode(Node):
+    def __init__(self):
+        super().__init__('fsm_node')
+
+        # Mission state
+        self.state = 'IDLE'
+        self.current_pos = [0.0, 0.0, 0.0]
+
+        # Publishers
+        self.cmd_pub = self.create_publisher(VehicleCommand, '/fmu/vehicle_command/in', 10)
+        self.setpoint_pub = self.create_publisher(TrajectorySetpoint, '/fmu/trajectory_setpoint/in', 10)
+        self.mode_pub = self.create_publisher(OffboardControlMode, '/fmu/offboard_control_mode/in', 10)
+
+        # Subscribers
+        self.odom_sub = self.create_subscription(VehicleOdometry, '/fmu/vehicle_odometry/out', self.odom_callback, 10)
+
+        # Timer to run FSM at 5Hz
+        self.timer = self.create_timer(0.2, self.run_fsm)
+
+    def odom_callback(self, msg):
+        # Save the current position (x, y, z)
+        self.current_pos = [msg.position[0], msg.position[1], msg.position[2]]
+
+    def run_fsm(self):
+        # Always publish offboard control mode
+        self.publish_offboard_mode()
+
+        if self.state == 'IDLE':
+            self.get_logger().info('Arming...')
+            self.arm()
+            self.state = 'TAKEOFF'
+
+        elif self.state == 'TAKEOFF':
+            self.publish_setpoint(0.0, 0.0, -5.0)
+            if self.current_pos[2] < -4.8:
+                self.state = 'NAV'
+                self.get_logger().info('Reached Takeoff Altitude → NAV')
+
+        elif self.state == 'NAV':
+            self.publish_setpoint(10.0, 0.0, -5.0)
+            if self.distance_to(10.0, 0.0) < 1.0:
+                self.state = 'TRANSITION'
+                self.get_logger().info('WP1 reached → VTOL Transition')
+                self.transition_to_fw()
+
+        elif self.state == 'TRANSITION':
+            self.publish_setpoint(20.0, 0.0, -5.0)
+
+    def distance_to(self, x, y):
+        # Calculate Euclidean distance to target (x, y)
+        dx = x - self.current_pos[0]
+        dy = y - self.current_pos[1]
+        return math.hypot(dx, dy)
+
+    def arm(self):
+        # Send ARM command to PX4
+        msg = VehicleCommand()
+        msg.timestamp = self.get_clock().now().nanoseconds // 1000
+        msg.param1 = 1.0
+        msg.command = VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        self.cmd_pub.publish(msg)
+
+    def transition_to_fw(self):
+        # Send VTOL transition command (MC to FW)
+        msg = VehicleCommand()
+        msg.timestamp = self.get_clock().now().nanoseconds // 1000
+        msg.param1 = 4.0  # 4.0 means MC to FW
+        msg.command = VehicleCommand.VEHICLE_CMD_DO_VTOL_TRANSITION
+        msg.target_system = 1
+        msg.target_component = 1
+        msg.source_system = 1
+        msg.source_component = 1
+        msg.from_external = True
+        self.cmd_pub.publish(msg)
+
+    def publish_setpoint(self, x, y, z):
+        # Publish position setpoint to PX4
+        msg = TrajectorySetpoint()
+        msg.timestamp = self.get_clock().now().nanoseconds // 1000
+        msg.position[0] = x
+        msg.position[1] = y
+        msg.position[2] = z
+        self.setpoint_pub.publish(msg)
+
+    def publish_offboard_mode(self):
+        # Publish offboard control mode to PX4
+        msg = OffboardControlMode()
+        msg.timestamp = self.get_clock().now().nanoseconds // 1000
+        msg.position = True
+        self.mode_pub.publish(msg)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = FSMNode()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
