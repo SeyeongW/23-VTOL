@@ -1,111 +1,156 @@
-import rclpy
-from rclpy.node import Node
-from px4_msgs.msg import VehicleOdometry, VehicleCommand
-from px4_msgs.msg import OffboardControlMode, TrajectorySetpoint
-import math
+#include <rclcpp/rclcpp.hpp>
+#include <px4_msgs/msg/vehicle_command.hpp>
+#include <px4_msgs/msg/vehicle_odometry.hpp>
+#include <px4_msgs/msg/offboard_control_mode.hpp>
+#include <px4_msgs/msg/trajectory_setpoint.hpp>
+#include <vector>
+#include <array>
+#include <cmath>
+#include <string>
 
-class FSMNode(Node):
-    def __init__(self):
-        super().__init__('fsm_node')
+using std::placeholders::_1;
+using std::chrono::milliseconds;
 
-        # Mission state
-        self.state = 'IDLE'
-        self.current_pos = [0.0, 0.0, 0.0]
+class FsmNode : public rclcpp::Node {
+public:
+  FsmNode() : Node("fsm_node") {
+    using namespace std::chrono_literals;
 
-        # Publishers
-        self.cmd_pub = self.create_publisher(VehicleCommand, '/fmu/vehicle_command/in', 10)
-        self.setpoint_pub = self.create_publisher(TrajectorySetpoint, '/fmu/trajectory_setpoint/in', 10)
-        self.mode_pub = self.create_publisher(OffboardControlMode, '/fmu/offboard_control_mode/in', 10)
+    vehicle_cmd_pub_ = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/vehicle_command/in", 10);
+    traj_pub_ = this->create_publisher<px4_msgs::msg::TrajectorySetpoint>("/fmu/trajectory_setpoint/in", 10);
+    offboard_mode_pub_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>("/fmu/offboard_control_mode/in", 10);
 
-        # Subscribers
-        self.odom_sub = self.create_subscription(VehicleOdometry, '/fmu/vehicle_odometry/out', self.odom_callback, 10)
+    odom_sub_ = this->create_subscription<px4_msgs::msg::VehicleOdometry>(
+      "/fmu/vehicle_odometry/out", 10, std::bind(&FsmNode::odomCallback, this, _1));
 
-        # Timer to run FSM at 5Hz
-        self.timer = self.create_timer(0.2, self.run_fsm)
+    timer_ = this->create_wall_timer(200ms, std::bind(&FsmNode::runFsm, this));
 
-    def odom_callback(self, msg):
-        # Save the current position (x, y, z)
-        self.current_pos = [msg.position[0], msg.position[1], msg.position[2]]
+    // Waypoints defined as {x, y, z}
+    waypoints_ = {
+      {10.0f, 0.0f, -5.0f},
+      {20.0f, 10.0f, -6.0f},
+      {30.0f, 15.0f, -5.0f},
+      {35.0f, 5.0f, -4.5f}
+    };
+  }
 
-    def run_fsm(self):
-        # Always publish offboard control mode
-        self.publish_offboard_mode()
+private:
+  std::string state_ = "IDLE";
+  float x_ = 0.0, y_ = 0.0, z_ = 0.0;
+  size_t current_wp_idx_ = 0;
+  bool transitioned_ = false;
+  int last_printed_wp_ = -1;
 
-        if self.state == 'IDLE':
-            self.get_logger().info('Arming...')
-            self.arm()
-            self.state = 'TAKEOFF'
+  std::vector<std::array<float, 3>> waypoints_;
 
-        elif self.state == 'TAKEOFF':
-            self.publish_setpoint(0.0, 0.0, -5.0)
-            if self.current_pos[2] < -4.8:
-                self.state = 'NAV'
-                self.get_logger().info('Reached Takeoff Altitude → NAV')
+  rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_cmd_pub_;
+  rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr traj_pub_;
+  rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr offboard_mode_pub_;
+  rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr odom_sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
 
-        elif self.state == 'NAV':
-            self.publish_setpoint(10.0, 0.0, -5.0)
-            if self.distance_to(10.0, 0.0) < 1.0:
-                self.state = 'TRANSITION'
-                self.get_logger().info('WP1 reached → VTOL Transition')
-                self.transition_to_fw()
+  void odomCallback(const px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
+    x_ = msg->position[0];
+    y_ = msg->position[1];
+    z_ = msg->position[2];
+  }
 
-        elif self.state == 'TRANSITION':
-            self.publish_setpoint(20.0, 0.0, -5.0)
+  void runFsm() {
+    publishOffboardMode();
 
-    def distance_to(self, x, y):
-        # Calculate Euclidean distance to target (x, y)
-        dx = x - self.current_pos[0]
-        dy = y - self.current_pos[1]
-        return math.hypot(dx, dy)
+    if (state_ == "IDLE") {
+      RCLCPP_INFO(this->get_logger(), "State: IDLE → TAKEOFF (arming)");
+      arm();
+      state_ = "TAKEOFF";
 
-    def arm(self):
-        # Send ARM command to PX4
-        msg = VehicleCommand()
-        msg.timestamp = self.get_clock().now().nanoseconds // 1000
-        msg.param1 = 1.0
-        msg.command = VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM
-        msg.target_system = 1
-        msg.target_component = 1
-        msg.source_system = 1
-        msg.source_component = 1
-        msg.from_external = True
-        self.cmd_pub.publish(msg)
+    } else if (state_ == "TAKEOFF") {
+      publishSetpoint(0.0f, 0.0f, -5.0f);
+      if (z_ < -4.8f) {
+        RCLCPP_INFO(this->get_logger(), "State: TAKEOFF → NAV");
+        state_ = "NAV";
+      }
 
-    def transition_to_fw(self):
-        # Send VTOL transition command (MC to FW)
-        msg = VehicleCommand()
-        msg.timestamp = self.get_clock().now().nanoseconds // 1000
-        msg.param1 = 4.0  # 4.0 means MC to FW
-        msg.command = VehicleCommand.VEHICLE_CMD_DO_VTOL_TRANSITION
-        msg.target_system = 1
-        msg.target_component = 1
-        msg.source_system = 1
-        msg.source_component = 1
-        msg.from_external = True
-        self.cmd_pub.publish(msg)
+    } else if (state_ == "NAV") {
+      if (current_wp_idx_ < waypoints_.size()) {
+        float tx = waypoints_[current_wp_idx_][0];
+        float ty = waypoints_[current_wp_idx_][1];
+        float tz = waypoints_[current_wp_idx_][2];
 
-    def publish_setpoint(self, x, y, z):
-        # Publish position setpoint to PX4
-        msg = TrajectorySetpoint()
-        msg.timestamp = self.get_clock().now().nanoseconds // 1000
-        msg.position[0] = x
-        msg.position[1] = y
-        msg.position[2] = z
-        self.setpoint_pub.publish(msg)
+        // Display current target waypoint info
+        if ((int)current_wp_idx_ != last_printed_wp_) {
+          RCLCPP_INFO(this->get_logger(), "Moving to WP_%zu: [%.1f, %.1f, %.1f]", current_wp_idx_, tx, ty, tz);
+          last_printed_wp_ = (int)current_wp_idx_;
+        }
 
-    def publish_offboard_mode(self):
-        # Publish offboard control mode to PX4
-        msg = OffboardControlMode()
-        msg.timestamp = self.get_clock().now().nanoseconds // 1000
-        msg.position = True
-        self.mode_pub.publish(msg)
+        publishSetpoint(tx, ty, tz);
 
-def main(args=None):
-    rclpy.init(args=args)
-    node = FSMNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+        if (distanceTo(tx, ty) < 1.0f) {
+          RCLCPP_INFO(this->get_logger(), "Reached WP_%zu", current_wp_idx_);
 
-if __name__ == '__main__':
-    main()
+          if (current_wp_idx_ == 1 && !transitioned_) {
+            transitionToFw();
+            transitioned_ = true;
+            RCLCPP_INFO(this->get_logger(), "→ Performed VTOL Transition at WP1");
+          }
+
+          current_wp_idx_++;
+        }
+      } else {
+        RCLCPP_INFO(this->get_logger(), "Mission complete: all waypoints reached.");
+      }
+    }
+  }
+
+  float distanceTo(float tx, float ty) {
+    return std::hypot(tx - x_, ty - y_);
+  }
+
+  void arm() {
+    px4_msgs::msg::VehicleCommand msg{};
+    msg.timestamp = this->now().nanoseconds() / 1000;
+    msg.param1 = 1.0;
+    msg.command = px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM;
+    msg.target_system = 1;
+    msg.target_component = 1;
+    msg.source_system = 1;
+    msg.source_component = 1;
+    msg.from_external = true;
+    vehicle_cmd_pub_->publish(msg);
+  }
+
+  void transitionToFw() {
+    px4_msgs::msg::VehicleCommand msg{};
+    msg.timestamp = this->now().nanoseconds() / 1000;
+    msg.param1 = 4.0f; // Transition to Fixed-Wing
+    msg.command = px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_VTOL_TRANSITION;
+    msg.target_system = 1;
+    msg.target_component = 1;
+    msg.source_system = 1;
+    msg.source_component = 1;
+    msg.from_external = true;
+    vehicle_cmd_pub_->publish(msg);
+  }
+
+  void publishSetpoint(float x, float y, float z) {
+    px4_msgs::msg::TrajectorySetpoint msg{};
+    msg.timestamp = this->now().nanoseconds() / 1000;
+    msg.position[0] = x;
+    msg.position[1] = y;
+    msg.position[2] = z;
+    traj_pub_->publish(msg);
+  }
+
+  void publishOffboardMode() {
+    px4_msgs::msg::OffboardControlMode msg{};
+    msg.timestamp = this->now().nanoseconds() / 1000;
+    msg.position = true;
+    offboard_mode_pub_->publish(msg);
+  }
+};
+
+int main(int argc, char *argv[]) {
+  rclcpp::init(argc, argv);
+  rclcpp::spin(std::make_shared<FsmNode>());
+  rclcpp::shutdown();
+  return 0;
+}
