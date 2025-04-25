@@ -90,10 +90,10 @@ private:
 					(ParamFloat<px4::params::VT_PSHER_SLEW>) _param_vt_psher_slew,
 					(ParamFloat<px4::params::VT_B_TRANS_RAMP>) _param_vt_b_trans_ramp,
 					(ParamFloat<px4::params::FW_PSP_OFF>) _param_fw_psp_off,
-					(ParamFloat<px4::params::VT_TRANS_AIRSPEED>) _param_trans_aspd,
-	                                (ParamFloat<px4::params::VT_TRANS_MAX_ACC>) _param_trans_acc,
-	                                (ParamFloat<px4::params::VT_TRANS_MIN_ALT>) _param_trans_alt,
-	                                (ParamFloat<px4::params::VT_TRANS_DROP_MAX>) _param_trans_drop
+					(ParamFloat<px4::params::VT_TR_AIRSPEED>) _param_trans_aspd,
+	                                (ParamFloat<px4::params::VT_TR_MAX_ACC>) _param_trans_acc,
+	                                (ParamFloat<px4::params::VT_TR_MIN_ALT>) _param_trans_alt,
+	                                (ParamFloat<px4::params::VT_TR_DROP_MAX>) _param_trans_drop
 				       )
 };
 #endif
