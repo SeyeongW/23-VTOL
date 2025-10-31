@@ -8,7 +8,7 @@ colcon build install
 #MAVLINK
 
 ros2 run mavros mavros_node --ros-args \
-  -p fcu_url:=udp://:14557@127.0.0.1:14540 \
+  -p fcu_url:=udp://:127.0.0.1:14540@14557 \
   -p tgt_system:=1
 
 #PX4_sitl
