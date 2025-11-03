@@ -3,7 +3,8 @@
 #Terminal command
 #ros2
 ros2 run <package> <node>
-colcon build install 
+colcon build install/setup.bash
+
 
 #MAVLINK
 
