@@ -1,0 +1,21 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>vtol_aruco</name>
+  <version>0.0.1</version>
+  <description>ArUco marker detector for PX4 VTOL in Gazebo</description>
+
+  <maintainer email="you@example.com">your_name</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>image_transport</depend>
+
+  <!-- OpenCV는 시스템에서 찾음 -->
+
+  <export>
+  </export>
+</package>

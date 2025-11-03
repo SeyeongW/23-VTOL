@@ -1,0 +1,87 @@
+// file: src/aruco_detector_node.cpp
+
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/image.hpp>
+#include <cv_bridge/cv_bridge.h>
+#include <image_transport/image_transport.hpp>
+
+#include <opencv2/opencv.hpp>
+#include <opencv2/aruco.hpp>
+
+class ArucoDetectorNode : public rclcpp::Node
+{
+public:
+    ArucoDetectorNode()
+    : Node("aruco_detector_node")
+    {
+        // camera topic 이름은 네 Gazebo 설정에 따라 바꿔
+        std::string image_topic = this->declare_parameter<std::string>("image_topic", "/camera/image_raw");
+        std::string dict_name   = this->declare_parameter<std::string>("dictionary", "DICT_4X4_50");
+
+        dict_ = getDictionary(dict_name);
+
+        sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+            image_topic, 10,
+            std::bind(&ArucoDetectorNode::imageCallback, this, std::placeholders::_1));
+
+        RCLCPP_INFO(this->get_logger(), "Aruco detector started. Subscribing: %s", image_topic.c_str());
+    }
+
+private:
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_;
+    cv::Ptr<cv::aruco::Dictionary> dict_;
+
+    cv::Ptr<cv::aruco::Dictionary> getDictionary(const std::string &name)
+    {
+        // 필요한 딕셔너리만 몇 개 지원
+        if (name == "DICT_4X4_50") {
+            return cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
+        } else if (name == "DICT_5X5_100") {
+            return cv::aruco::getPredefinedDictionary(cv::aruco::DICT_5X5_100);
+        } else if (name == "DICT_6X6_250") {
+            return cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
+        } else {
+            // fallback
+            return cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
+        }
+    }
+
+    void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
+    {
+        cv_bridge::CvImagePtr cv_ptr;
+        try {
+            cv_ptr = cv_bridge::toCvCopy(msg, "bgr8");
+        } catch (cv_bridge::Exception &e) {
+            RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
+            return;
+        }
+
+        cv::Mat frame = cv_ptr->image;
+        std::vector<int> ids;
+        std::vector<std::vector<cv::Point2f>> corners;
+
+        cv::aruco::detectMarkers(frame, dict_, corners, ids);
+
+        if (!ids.empty()) {
+            RCLCPP_INFO(this->get_logger(), "Detected %zu markers", ids.size());
+            for (size_t i = 0; i < ids.size(); i++) {
+                RCLCPP_INFO(this->get_logger(), "Marker id: %d", ids[i]);
+            }
+
+            // 디버그용으로 그려볼 수도 있음
+            cv::aruco::drawDetectedMarkers(frame, corners, ids);
+        }
+
+        // 여기서 이미지 다시 퍼블리시 하고 싶으면 image_transport로 보내면 됨
+        // 이번 버전은 콘솔 로그만
+    }
+};
+
+int main(int argc, char **argv)
+{
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<ArucoDetectorNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
+    return 0;
+}
