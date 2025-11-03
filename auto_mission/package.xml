@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>auto_mission</name>
+  <version>0.0.1</version>
+  <description>PX4 VTOL auto mission node (lift+cruise, SITL + Gazebo)</description>
+
+  <maintainer email="you@example.com">your_name</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- build -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- run/build deps -->
+  <depend>rclcpp</depend>
+  <depend>px4_msgs</depend>
+
+  <!-- test (optional) -->
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+  </export>
+</package>
