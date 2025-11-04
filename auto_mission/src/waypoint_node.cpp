@@ -1,251 +1,320 @@
-// file: vtol_auto_waypoint_node.cpp
-// build: ros2 humble, depends on rclcpp, px4_msgs
-// all comments and log messages are in English as you wanted.
-
 #include <chrono>
-#include <memory>
-#include <vector>
 #include <cmath>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+#include <algorithm>
 
 #include "rclcpp/rclcpp.hpp"
 #include "px4_msgs/msg/vehicle_status.hpp"
 #include "px4_msgs/msg/vehicle_local_position.hpp"
 #include "px4_msgs/msg/vehicle_command.hpp"
+#include "px4_msgs/msg/home_position.hpp"
 
 using namespace std::chrono_literals;
+
+static inline double deg2rad(double d){ return d * M_PI / 180.0; }
+static inline double rad2deg(double r){ return r * 180.0 / M_PI; }
 
 class VtolAutoWaypointNode : public rclcpp::Node
 {
 public:
-    VtolAutoWaypointNode()
-    : Node("vtol_auto_waypoint_node")
+    VtolAutoWaypointNode() : Node("vtol_auto_waypoint_node")
     {
         using std::placeholders::_1;
 
-        vehicle_status_sub_ = this->create_subscription<px4_msgs::msg::VehicleStatus>(
+        // ---------------- Parameters ----------------
+        takeoff_alt_m_       = this->declare_parameter<double>("takeoff_alt_m",        20.0);
+        v_req_ms_            = this->declare_parameter<double>("forward_req_speed_ms", 12.0);   // 천이 전 속도 조건 (m/s)
+        a_limit_g_           = this->declare_parameter<double>("transition_acc_g_max", 0.3);   // 천이시 |a| ≤ 0.3 g
+        xy_tol_m_            = this->declare_parameter<double>("xy_tol_m",             6.0);
+        z_tol_m_             = this->declare_parameter<double>("z_tol_m",              3.0);
+        ctrl_period_ms_      = this->declare_parameter<int>("control_period_ms",       100);
+        progress_log_ms_     = this->declare_parameter<int>("progress_log_ms",         1500);
+
+        // ---------------- I/O ----------------
+        status_sub_ = this->create_subscription<px4_msgs::msg::VehicleStatus>(
             "/fmu/out/vehicle_status", 10,
-            std::bind(&VtolAutoWaypointNode::vehicleStatusCallback, this, _1));
+            std::bind(&VtolAutoWaypointNode::statusCb, this, _1));
 
-        local_pos_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>(
+        lpos_sub_ = this->create_subscription<px4_msgs::msg::VehicleLocalPosition>(
             "/fmu/out/vehicle_local_position", 10,
-            std::bind(&VtolAutoWaypointNode::localPositionCallback, this, _1));
+            std::bind(&VtolAutoWaypointNode::lposCb, this, _1));
 
-        vehicle_cmd_pub_ = this->create_publisher<px4_msgs::msg::VehicleCommand>(
-            "/fmu/in/vehicle_command", 10);
+        home_sub_ = this->create_subscription<px4_msgs::msg::HomePosition>(
+            "/fmu/out/home_position", 10,
+            std::bind(&VtolAutoWaypointNode::homeCb, this, _1));
+
+        cmd_pub_ = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 10);
 
         timer_ = this->create_wall_timer(
-            200ms, std::bind(&VtolAutoWaypointNode::controlLoop, this));
+            std::chrono::milliseconds(ctrl_period_ms_),
+            std::bind(&VtolAutoWaypointNode::controlLoop, this));
 
-        RCLCPP_INFO(this->get_logger(), "VTOL auto waypoint node started.");
+        RCLCPP_INFO(get_logger(), "VTOL auto mission node (WP1 MC -> WP2 transition -> WP3-5 FW -> back WP2 transition -> WP1 -> HOME LAND)");
 
-        // define mission waypoints in local NED
-        // (x, y, z, yaw_deg)  z is Down, so -10.0 means 10 m altitude
-        waypoints_ = {
-            {50.0f, 0.0f, -20.0f, 0.0f},
-            {100.0f, 30.0f, -20.0f, 45.0f},
-            {150.0f, 0.0f, -20.0f, 0.0f}
-        };
+        // ---------------- Waypoints (LOCAL NED) ----------------
+        // 필요하면 GLOBAL도 혼용 가능하지만, 여기선 NED 고정 예시로 간단히.
+        // z는 Down(+). -takeoff_alt_m_가 고도 takeoff_alt_m_ 의미.
+        wp1_ = {0,  60.0,   0.0, -takeoff_alt_m_,  0.0f}; // MC로 먼저 갈 지점
+        wp2_ = {0, 100.0,  30.0, -takeoff_alt_m_, 45.0f}; // 천이 후 첫 지점
+        wp3_ = {0, 140.0,   0.0, -takeoff_alt_m_,  0.0f};
+        wp4_ = {0, 180.0, -30.0, -takeoff_alt_m_, -45.0f};
+        wp5_ = {0, 220.0,   0.0, -takeoff_alt_m_,  0.0f};
+
+        // 가속도 추정을 위한 초기화
+        last_vx_ = NAN; last_vy_ = NAN; last_v_ts_ = this->now();
     }
 
 private:
-    // mission phases
-    enum class MissionState {
-        WAIT_FOR_SYSTEM = 0,
-        ARM,
-        TAKEOFF,
-        TRANSITION_TO_FW,
-        NAV_WAYPOINTS,
+    // ---------- Types ----------
+    struct Wp {
+        int frame;        // 0: LOCAL(NED)
+        double x, y, z;   // local meters (N,E,Down)
+        float yaw_deg;
+    };
+
+    enum class St {
+        WAIT = 0,
+        ARM, TAKEOFF,
+        MC_TO_WP1,
+        CHECK_TRANSITION_COND,   // (v >= v_req) && (|a_horiz| <= 0.3 g)
+        TRANSITION_MC2FW,
+        FW_WP2, FW_WP3, FW_WP4, FW_WP5,
+        BACK_TO_WP2,
+        TRANSITION_FW2MC,
+        MC_TO_WP1_BACK,
+        LAND_HOME,
         DONE
     };
 
-    MissionState mission_state_ {MissionState::WAIT_FOR_SYSTEM};
+    // ---------- PX4 state ----------
+    uint8_t arming_state_{0};
+    bool lpos_valid_{false};
+    double x_{0}, y_{0}, z_{0}, vx_{0}, vy_{0};
+    bool home_valid_{false};
+    double home_lat_{0}, home_lon_{0}, home_alt_{0};
 
-    // PX4 info
-    uint8_t nav_state_ {0};
-    uint8_t arming_state_ {0};
-    bool local_pos_valid_ {false};
-    float curr_x_ {0.0f}, curr_y_ {0.0f}, curr_z_ {0.0f};
+    // accel estimate
+    double last_vx_{NAN}, last_vy_{NAN};
+    rclcpp::Time last_v_ts_;
 
-    // waypoint data
-    struct Wp {
-        float x;
-        float y;
-        float z;
-        float yaw_deg;
-    };
-    std::vector<Wp> waypoints_;
-    size_t current_wp_idx_ {0};
+    // ---------- mission ----------
+    Wp wp1_, wp2_, wp3_, wp4_, wp5_;
+    St st_{St::WAIT};
+    rclcpp::Time last_log_ts_;
 
-    // publishers / subscribers
-    rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
-    rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr local_pos_sub_;
-    rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_cmd_pub_;
+    // ---------- params ----------
+    double takeoff_alt_m_{20.0};
+    double v_req_ms_{12.0};
+    double a_limit_g_{0.3};
+    double xy_tol_m_{6.0};
+    double z_tol_m_{3.0};
+    int    ctrl_period_ms_{100};
+    int    progress_log_ms_{1500};
+
+    // ---------- ROS ----------
+    rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr status_sub_;
+    rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr lpos_sub_;
+    rclcpp::Subscription<px4_msgs::msg::HomePosition>::SharedPtr home_sub_;
+    rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr cmd_pub_;
     rclcpp::TimerBase::SharedPtr timer_;
 
-    // helper: send vehicle command
-    void sendVehicleCommand(uint16_t command,
-                            float param1 = 0.0f,
-                            float param2 = 0.0f,
-                            float param3 = 0.0f,
-                            float param4 = 0.0f,
-                            float param5 = 0.0f,
-                            float param6 = 0.0f,
-                            float param7 = 0.0f)
-    {
-        px4_msgs::msg::VehicleCommand cmd{};
-        cmd.timestamp = this->get_clock()->now().nanoseconds() / 1000; // px4 wants us timestamp in usec
-        cmd.param1 = param1;
-        cmd.param2 = param2;
-        cmd.param3 = param3;
-        cmd.param4 = param4;
-        cmd.param5 = param5;
-        cmd.param6 = param6;
-        cmd.param7 = param7;
-        cmd.command = command;
-        cmd.target_system = 1;
-        cmd.target_component = 1;
-        cmd.source_system = 1;
-        cmd.source_component = 1;
-        cmd.from_external = true;
+    // ---------- helpers ----------
+    uint64_t nowUsec() const { return this->get_clock()->now().nanoseconds()/1000; }
+    double gs() const { return std::hypot(vx_{0}, vy_{0}); }
 
-        vehicle_cmd_pub_->publish(cmd);
+    void sendCmd(uint16_t cmd, float p1=0,float p2=0,float p3=0,float p4=0,float p5=0,float p6=0,float p7=0){
+        px4_msgs::msg::VehicleCommand c{};
+        c.timestamp = nowUsec();
+        c.param1=p1; c.param2=p2; c.param3=p3; c.param4=p4; c.param5=p5; c.param6=p6; c.param7=p7;
+        c.command = cmd;
+        c.target_system=1; c.target_component=1; c.source_system=1; c.source_component=1;
+        c.from_external = true;
+        cmd_pub_->publish(c);
     }
 
-    void vehicleStatusCallback(const px4_msgs::msg::VehicleStatus::SharedPtr msg)
-    {
-        nav_state_ = msg->nav_state;
-        arming_state_ = msg->arming_state;
+    bool reachedLocal(const Wp &wp) const {
+        double dx=x_-wp.x, dy=y_-wp.y, dz=z_-wp.z;
+        return (std::hypot(dx,dy) < xy_tol_m_) && (std::fabs(dz) < z_tol_m_);
     }
 
-    void localPositionCallback(const px4_msgs::msg::VehicleLocalPosition::SharedPtr msg)
+    void gotoLocalAsGlobal(const Wp &wp){ // 홈 기준 ENU~LLA 변환 생략: SITL 데모에선 NAV_WAYPOINT 글로벌 대신 로컬 Progress만 사용
+        // 실제 비행에선 local->global 변환하여 NAV_WAYPOINT로 지시하는 게 안전.
+        // 여기서는 단순히 주기적으로 진행상황만 로깅하며, 도달 판정은 local로 처리.
+        (void)wp; // no-op command here; PX4 navigator에 실제 global waypoint를 넣고 싶으면 변환/전송 코드를 추가.
+    }
+
+    // 수평가속도 추정 (m/s^2) – vx,vy의 차분
+    double horizAccelEstimate(){
+        auto nowt = this->now();
+        double dt = (nowt - last_v_ts_).seconds();
+        if (dt < 1e-3 || std::isnan(last_vx_) || std::isnan(last_vy_)){
+            last_vx_ = vx_{0}; last_vy_ = vy_{0}; last_v_ts_ = nowt;
+            return 0.0;
+        }
+        double ax = (vx_{0} - last_vx_) / dt;
+        double ay = (vy_{0} - last_vy_) / dt;
+        last_vx_ = vx_{0}; last_vy_ = vy_{0}; last_v_ts_ = nowt;
+        return std::hypot(ax, ay);
+    }
+
+    // ---------- callbacks ----------
+    void statusCb(const px4_msgs::msg::VehicleStatus::SharedPtr m){
+        arming_state_ = m->arming_state;
+    }
+    void lposCb(const px4_msgs::msg::VehicleLocalPosition::SharedPtr m){
+        if (m->xy_valid && m->z_valid){
+            lpos_valid_ = true;
+            x_ = m->x; y_ = m->y; z_ = m->z;
+            vx_ = m->vx; vy_ = m->vy;
+        }else lpos_valid_ = false;
+    }
+    void homeCb(const px4_msgs::msg::HomePosition::SharedPtr m){
+        // 주의: PX4 버전에 따라 단위가 다를 수 있음. (여기선 SITL 기본 가정)
+        home_lat_ = m->latitude;
+        home_lon_ = m->longitude;
+        home_alt_ = m->altitude;
+        home_valid_ = true;
+    }
+
+    // ---------- main loop ----------
+    void controlLoop()
     {
-        if (msg->xy_valid && msg->z_valid) {
-            local_pos_valid_ = true;
-            curr_x_ = msg->x;
-            curr_y_ = msg->y;
-            curr_z_ = msg->z;
-        } else {
-            local_pos_valid_ = false;
+        switch (st_)
+        {
+        case St::WAIT:
+            if (lpos_valid_){
+                RCLCPP_INFO(get_logger(), "[WAIT] Local position valid -> ARM");
+                st_ = St::ARM;
+            }
+            break;
+
+        case St::ARM:
+            if (arming_state_ != px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED){
+                RCLCPP_INFO(get_logger(), "[ARM] Arm request");
+                sendCmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.f);
+            } else {
+                RCLCPP_INFO(get_logger(), "[ARM] Armed -> TAKEOFF %.1fm", takeoff_alt_m_);
+                sendCmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_TAKEOFF, 0,0,0,NAN, 0,0, (float)takeoff_alt_m_);
+                st_ = St::TAKEOFF;
+            }
+            break;
+
+        case St::TAKEOFF:
+            if (std::fabs(z_ + takeoff_alt_m_) < z_tol_m_){
+                RCLCPP_INFO(get_logger(), "[TAKEOFF] Alt ok -> MC_TO_WP1");
+                st_ = St::MC_TO_WP1;
+            }
+            break;
+
+        case St::MC_TO_WP1:
+            progressLog("MC→WP1", wp1_);
+            // (실제 제어명령 없이 PX4 navigator/position controller가 움직인다고 가정한 데모)
+            gotoLocalAsGlobal(wp1_);
+            if (reachedLocal(wp1_)){
+                RCLCPP_INFO(get_logger(), "[MC] WP1 reached -> CHECK_TRANSITION_COND");
+                st_ = St::CHECK_TRANSITION_COND;
+            }
+            break;
+
+        case St::CHECK_TRANSITION_COND:
+        {
+            double v = gs();
+            double a = horizAccelEstimate();          // m/s^2
+            double a_g = a / 9.80665;                 // g 단위
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
+                                 "[TRANSITION CHECK] v=%.1f m/s  |a|=%.2f g (limit=%.2f g)",
+                                 v, a_g, a_limit_g_);
+
+            if (v >= v_req_ms_ && a_g <= a_limit_g_){
+                RCLCPP_INFO(get_logger(), "[TRANSITION] Conditions met -> request MC->FW");
+                sendCmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_VTOL_TRANSITION, 3.f); // 3: MC->FW
+                st_ = St::TRANSITION_MC2FW;
+            }
+            break;
+        }
+
+        case St::TRANSITION_MC2FW:
+            RCLCPP_INFO(get_logger(), "[TRANSITION] MC->FW requested -> FW_WP2");
+            st_ = St::FW_WP2;
+            break;
+
+        case St::FW_WP2:
+            navToWpFw("FW→WP2", wp2_, St::FW_WP3);
+            break;
+        case St::FW_WP3:
+            navToWpFw("FW→WP3", wp3_, St::FW_WP4);
+            break;
+        case St::FW_WP4:
+            navToWpFw("FW→WP4", wp4_, St::FW_WP5);
+            break;
+        case St::FW_WP5:
+            navToWpFw("FW→WP5", wp5_, St::BACK_TO_WP2);
+            break;
+
+        case St::BACK_TO_WP2:
+            navToWpFw("FW back→WP2", wp2_, St::TRANSITION_FW2MC);
+            break;
+
+        case St::TRANSITION_FW2MC:
+            RCLCPP_INFO(get_logger(), "[TRANSITION] Request FW->MC");
+            sendCmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_VTOL_TRANSITION, 4.f); // 4: FW->MC
+            st_ = St::MC_TO_WP1_BACK;
+            break;
+
+        case St::MC_TO_WP1_BACK:
+            progressLog("MC back→WP1", wp1_);
+            if (reachedLocal(wp1_)){
+                RCLCPP_INFO(get_logger(), "[MC] Passed WP1 -> LAND_HOME");
+                st_ = St::LAND_HOME;
+            }
+            break;
+
+        case St::LAND_HOME:
+            if (!home_valid_){
+                RCLCPP_WARN(get_logger(), "[LAND] home invalid; waiting...");
+                break;
+            }
+            RCLCPP_INFO(get_logger(), "[LAND] NAV_LAND @HOME");
+            sendCmd(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_LAND,
+                    0,0,0,NAN, (float)home_lat_, (float)home_lon_, (float)home_alt_);
+            st_ = St::DONE;
+            break;
+
+        case St::DONE:
+            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 3000, "[DONE] Mission complete.");
+            break;
         }
     }
 
-    bool reachedAltitude(float target_down, float tol = 1.0f)
-    {
-        // target_down is negative (e.g. -20m)
-        return std::fabs(curr_z_ - target_down) < tol;
+    void progressLog(const char* tag, const Wp& wp){
+        auto nowt = this->now();
+        if (last_log_ts_.nanoseconds()==0 ||
+            (nowt - last_log_ts_).milliseconds() >= progress_log_ms_)
+        {
+            double rem = std::hypot(x_-wp.x, y_-wp.y);
+            RCLCPP_INFO(get_logger(), "[%s] remain_xy=%.1fm z_err=%.1fm",
+                        tag, rem, std::fabs(z_-wp.z));
+            last_log_ts_ = nowt;
+        }
     }
 
-    bool reachedWaypoint(const Wp &wp, float xy_tol = 5.0f, float z_tol = 2.0f)
-    {
-        float dx = curr_x_ - wp.x;
-        float dy = curr_y_ - wp.y;
-        float dz = curr_z_ - wp.z;
-        return (std::sqrt(dx*dx + dy*dy) < xy_tol) && (std::fabs(dz) < z_tol);
-    }
-
-    void controlLoop()
-    {
-        switch (mission_state_) {
-        case MissionState::WAIT_FOR_SYSTEM:
-            if (local_pos_valid_) {
-                RCLCPP_INFO(this->get_logger(), "[WAIT_FOR_SYSTEM] Local position valid. Moving to ARM.");
-                mission_state_ = MissionState::ARM;
-            }
-            break;
-
-        case MissionState::ARM:
-            if (arming_state_ != px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED) {
-                RCLCPP_INFO(this->get_logger(), "[ARM] Sending arm command...");
-                sendVehicleCommand(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0f);
-            } else {
-                RCLCPP_INFO(this->get_logger(), "[ARM] Armed. Going to TAKEOFF.");
-                mission_state_ = MissionState::TAKEOFF;
-            }
-            break;
-
-        case MissionState::TAKEOFF:
-            // send auto takeoff: VEHICLE_CMD_NAV_TAKEOFF
-            // param7: altitude (amsl). but in SITL local is OK, so we use 20m
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                                 "[TAKEOFF] Sending NAV_TAKEOFF to 20m...");
-            sendVehicleCommand(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_NAV_TAKEOFF,
-                               0.0f, 0.0f, 0.0f, NAN, 0.0f, 0.0f, 20.0f); // 20m
-
-            // when z ~= -20 -> transition
-            if (reachedAltitude(-20.0f, 2.0f)) {
-                RCLCPP_INFO(this->get_logger(), "[TAKEOFF] Altitude reached. Transition to FW.");
-                mission_state_ = MissionState::TRANSITION_TO_FW;
-            }
-            break;
-
-        case MissionState::TRANSITION_TO_FW:
-            // PX4 MAV_CMD_DO_VTOL_TRANSITION
-            // param1 = 3 -> MC to FW
-            RCLCPP_INFO(this->get_logger(), "[TRANSITION] Sending VTOL transition MC->FW...");
-            sendVehicleCommand(px4_msgs::msg::VehicleCommand::VEHICLE_CMD_DO_VTOL_TRANSITION, 3.0f);
-            // wait a bit by staying in this state next loop
-            // simple: just jump to NAV_WAYPOINTS directly
-            mission_state_ = MissionState::NAV_WAYPOINTS;
-            break;
-
-        case MissionState::NAV_WAYPOINTS:
-            if (current_wp_idx_ >= waypoints_.size()) {
-                RCLCPP_INFO(this->get_logger(), "[NAV] All waypoints done. Mission complete.");
-                mission_state_ = MissionState::DONE;
-                break;
-            }
-
-            {
-                const auto &wp = waypoints_[current_wp_idx_];
-
-                // send reposition command to navigator
-                // MAV_CMD_DO_REPOSITION:
-                // param5 = lat, param6 = lon, param7 = alt (if global)
-                // BUT we want local → use param1=1 (ground speed), param2=0, then position in local?
-                // In PX4 offboard examples, easier way is to send NAV_WAYPOINT.
-                // Here we use NAV_WAYPOINT with local position set by current position + offset (SITL ok).
-
-                // We'll send NAV_WAYPOINT in LOCAL frame using param4=yaw, x,y,z in param5..7 is for global
-                // => So instead we use DO_REPOSITION with local target in NED via local_pos_setpoint?:
-                // To keep it robust, just call NAV_WAYPOINT with global disabled and PX4 will interpret.
-                // For SITL demo we'll fake as if wp is relative (NED) and use param1=0, param2=0...
-
-                RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-                                     "[NAV] Sending waypoint %zu (x=%.1f, y=%.1f, z=%.1f)...",
-                                     current_wp_idx_, wp.x, wp.y, wp.z);
-
-                // PX4 supports MAV_CMD_DO_REPOSITION where param5,6,7 are lat,lon,alt
-                // but we are in local → simplest is send a triplet of position via navigator:
-                // we will call VEHICLE_CMD_DO_REPOSITION with current lat/lon replaced later if needed.
-                // For SITL local-only test: we can just check "reachedWaypoint" and advance.
-                // (In real flight you'd convert local NED -> global and send real lat/lon)
-
-                // Just check if we reached the wp (local) and then increment
-                if (reachedWaypoint(wp)) {
-                    RCLCPP_INFO(this->get_logger(), "[NAV] Waypoint %zu reached.", current_wp_idx_);
-                    current_wp_idx_++;
-                } else {
-                    // we still need to tell PX4 to fly forward → easiest: send FW loiter-to-alt
-                    // but to keep example simple we just keep sending forward transition
-                    // In a real project: convert local NED -> global and call DO_REPOSITION here.
-                }
-            }
-            break;
-
-        case MissionState::DONE:
-            // optional: loiter or land
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-                                 "[DONE] Mission finished. You can disarm or RTL manually.");
-            break;
+    void navToWpFw(const char* tag, const Wp& wp, St next_state){
+        progressLog(tag, wp);
+        // (필요시 여기서 local->global 변환 후 NAV_WAYPOINT 전송 코드를 추가 가능)
+        if (reachedLocal(wp)){
+            RCLCPP_INFO(get_logger(), "[%s] reached -> next", tag);
+            st_ = next_state;
         }
     }
 };
 
-int main(int argc, char *argv[])
+int main(int argc, char* argv[])
 {
     rclcpp::init(argc, argv);
-    auto node = std::make_shared<VtolAutoWaypointNode>();
-    rclcpp::spin(node);
+    rclcpp::spin(std::make_shared<VtolAutoWaypointNode>());
     rclcpp::shutdown();
     return 0;
 }
