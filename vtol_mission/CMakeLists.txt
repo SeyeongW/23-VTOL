@@ -10,8 +10,9 @@ find_package(mavros_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 
-add_executable(basic_takeoff_land_node src/basic_takeoff_land_node.cpp)
-ament_target_dependencies(basic_takeoff_land_node
+add_executable(vtol_mission src/vtol_mission.cpp)
+
+ament_target_dependencies(vtol_mission
   rclcpp
   mavros_msgs
   geometry_msgs
@@ -19,7 +20,7 @@ ament_target_dependencies(basic_takeoff_land_node
 )
 
 install(TARGETS
-  basic_takeoff_land_node
+  vtol_mission
   DESTINATION lib/${PROJECT_NAME}
 )
 

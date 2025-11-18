@@ -1,9 +1,9 @@
 #include <chrono>
 #include <memory>
 #include "rclcpp/rclcpp.hpp"
-#include "std_msgs/msg/empty.hpp" 
-#include "mavros_msgs/msg/state.hpp"
+#include "std_msgs/msg/empty.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
+#include "mavros_msgs/msg/state.hpp"
 #include "mavros_msgs/srv/set_mode.hpp"
 #include "mavros_msgs/srv/command_bool.hpp"
 #include "mavros_msgs/srv/command_tol.hpp" 
@@ -13,17 +13,17 @@ using namespace std::chrono_literals;
 class BasicTakeoffLandNode : public rclcpp::Node
 {
 public:
-    BasicTakeoffLandNode() : Node("basic_takeoff_land_node")
+    BasicTakeoffLandNode() : Node("vtol_mission_node")
     {
         mission_state_ = MissionState::WAIT_FOR_COMMAND;
         
         state_sub_ = this->create_subscription<mavros_msgs::msg::State>(
             "/mavros/state", 10, std::bind(&BasicTakeoffLandNode::stateCallback, this, std::placeholders::_1));
         
-        local_pos_sub_ = this->create_subscription<geometry_msgs/msg::PoseStamped>(
+        local_pos_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
             "/mavros/local_position/pose", 10, std::bind(&BasicTakeoffLandNode::localPositionCallback, this, std::placeholders::_1));
 
-        start_sub_ = this->create_subscription<std_msgs/msg/Empty>(
+        start_sub_ = this->create_subscription<std_msgs::msg::Empty>(
             "/mission/start", 10, std::bind(&BasicTakeoffLandNode::startCallback, this, std::placeholders::_1));
 
         arming_client_ = this->create_client<mavros_msgs::srv::CommandBool>("/mavros/cmd/arming");
@@ -41,7 +41,7 @@ private:
         WAIT_FOR_COMMAND, 
         SET_GUIDED_MODE,
         ARM,
-        REQUEST_TAKEOF,
+        REQUEST_TAKEOFF, // (오타 수정됨)
         CLIMBING,
         HOLDING,
         SET_LAND_MODE,
