@@ -1,0 +1,9 @@
+version: '3.8'
+
+services:
+  vtol_mission:
+    image: seyeongw/vtol_mission:latest
+    
+    build:
+      context: .
+    platform: linux/arm64 
