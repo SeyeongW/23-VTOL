@@ -179,7 +179,7 @@ int main(int argc, char *argv[])
     if (fabsf(err_x) < DEADZONE) err_x = 0.0f;
     if (fabsf(err_y) < DEADZONE) err_y = 0.0f;
 
-    int yaw_cmd   = (int)(err_x * 100.0f * KP_X);
+    int yaw_cmd   = (int)(-err_x * 100.0f * KP_X);
     int pitch_cmd = (int)(-err_y * 100.0f * KP_Y);  // invert pitch if needed
 
     printf("[INFO] bbox=(%.3f, %.3f, %.3f, %.3f), center=(%.3f, %.3f), "
