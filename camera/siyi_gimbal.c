@@ -126,30 +126,26 @@ static void send_speed(int sockfd,
     printf("[SIYI] Speed command yaw=%d pitch=%d\n", yaw_speed, pitch_speed);
     send_siyi_packet(sockfd, addr, 0x07, data, 2);
 }
-// 위아래로 3번 까딱 (pitch 제스처)
+//(yaw 제스처)
 static void gimbal_gesture(int sockfd, struct sockaddr_in *addr)
 {
-    int up_speed   = 25;   // 위로 올릴 속도
-    int down_speed = -25;  // 아래로 내릴 속도
-    useconds_t dur = 250000; // 0.25초
+    int right_speed = 25;     // 오른쪽으로 돌릴 속도
+    int left_speed  = -25;    // 왼쪽으로 돌릴 속도
+    useconds_t dur  = 250000; // 0.25초
 
     for (int i = 0; i < 3; i++) {
-        // 위로
-        send_speed(sockfd, addr, 0, up_speed);
+        // 오른쪽
+        send_speed(sockfd, addr, right_speed, 0);
         usleep(dur);
 
-        // 아래로
-        send_speed(sockfd, addr, 0, down_speed);
+        // 왼쪽
+        send_speed(sockfd, addr, left_speed, 0);
         usleep(dur);
     }
 
-    // 마지막에 살짝 중앙 쪽으로 복귀시키고 정지하고 싶으면:
-    send_speed(sockfd, addr, 0, 15);
-    usleep(150000);
-
-    // 완전 정지
     send_speed(sockfd, addr, 0, 0);
 }
+
 
 int main(int argc, char *argv[])
 {

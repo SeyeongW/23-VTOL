@@ -36,15 +36,22 @@ def pose_to_vector(points):
 def on_pose_stable(user_data, frame, pose_vec):
     """
     Called once when pose has been stable for user_data.pose_stable_sec seconds.
-    Trigger gimbal gesture.
+    Trigger gimbal gesture (only once per run).
     """
+    if getattr(user_data, "gesture_done", False):
+        # 이미 제스처 한 번 수행했으면 다시 안 함
+        print("[POSE] Gesture already done, skipping.")
+        return
+
+    user_data.gesture_done = True  # 다시 못 하게 잠금
     print(
         "[POSE] Pose has been stable for %.1f seconds. Triggering gesture..."
         % user_data.pose_stable_sec
     )
 
     try:
-        subprocess.run([user_data.c_program_path, "gesture"], check=False)
+        # 블로킹(멈춰서 기다리는) 대신 비동기 실행
+        subprocess.Popen([user_data.c_program_path, "gesture"])
     except Exception as e:
         print(f"[Error] Failed to run gesture: {e}")
 
@@ -84,6 +91,7 @@ class user_app_callback_class(app_callback_class):
     def __init__(self):
         super().__init__()
 
+        self.gesture_done = False  # whether gesture has been done
         # Path to compiled C program that controls the gimbal
         self.c_program_path = "./siyi_gimbal"
 
@@ -109,7 +117,6 @@ class user_app_callback_class(app_callback_class):
 
         # time tracking for dt
         self.last_ts = None
-
         if not os.path.exists(self.c_program_path):
             print(f"[ERROR] C program not found at: {self.c_program_path}")
             print("Please compile it first: gcc siyi_gimbal.c -o siyi_gimbal -lm")
