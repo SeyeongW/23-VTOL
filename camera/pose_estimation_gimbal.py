@@ -1,13 +1,13 @@
 from pathlib import Path
 import gi
-gi.require_version('Gst', '1.0')
+gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib
 import os
 import numpy as np
 import cv2
 import hailo
 import subprocess
-import time  # ★ 추가
+import time
 
 from hailo_apps.hailo_app_python.core.common.buffer_utils import (
     get_caps_from_pad,
@@ -18,8 +18,9 @@ from hailo_apps.hailo_app_python.apps.pose_estimation.pose_estimation_pipeline i
     GStreamerPoseEstimationApp,
 )
 
+
 # -----------------------------------------------------------------------------------------------
-# Helper functions for pose handling
+# Helper functions
 # -----------------------------------------------------------------------------------------------
 def pose_to_vector(points):
     """
@@ -35,40 +36,79 @@ def pose_to_vector(points):
 def on_pose_stable(user_data, frame, pose_vec):
     """
     Called once when pose has been stable for user_data.pose_stable_sec seconds.
-    Here we trigger the gimbal gesture.
+    Trigger gimbal gesture.
     """
-    print("[POSE] Pose has been stable for %.1f seconds. Triggering gesture..." %
-          user_data.pose_stable_sec)
+    print(
+        "[POSE] Pose has been stable for %.1f seconds. Triggering gesture..."
+        % user_data.pose_stable_sec
+    )
 
     try:
-        # Call C program in "gesture" mode
         subprocess.run([user_data.c_program_path, "gesture"], check=False)
     except Exception as e:
         print(f"[Error] Failed to run gesture: {e}")
 
 
+def bbox_iou(a, b):
+    """
+    IoU of two bboxes in [ymin, xmin, ymax, xmax] normalized coords.
+    """
+    aymin, axmin, aymax, axmax = a
+    bymin, bxmin, bymax, bxmax = b
+
+    inter_ymin = max(aymin, bymin)
+    inter_xmin = max(axmin, bxmin)
+    inter_ymax = min(aymax, bymax)
+    inter_xmax = min(axmax, bxmax)
+
+    inter_w = max(0.0, inter_xmax - inter_xmin)
+    inter_h = max(0.0, inter_ymax - inter_ymin)
+    inter_area = inter_w * inter_h
+
+    if inter_area <= 0.0:
+        return 0.0
+
+    area_a = max(0.0, (aymax - aymin)) * max(0.0, (axmax - axmin))
+    area_b = max(0.0, (bymax - bymin)) * max(0.0, (bxmax - bxmin))
+    union = area_a + area_b - inter_area
+    if union <= 0.0:
+        return 0.0
+
+    return inter_area / union
+
+
 # -----------------------------------------------------------------------------------------------
-# User-defined class to be used in the callback function
+# User callback class
 # -----------------------------------------------------------------------------------------------
 class user_app_callback_class(app_callback_class):
     def __init__(self):
         super().__init__()
+
         # Path to compiled C program that controls the gimbal
-        # (Assuming siyi_gimbal is in the same directory as this script)
         self.c_program_path = "./siyi_gimbal"
 
         # Whether to get video frames from the buffer
         self.use_frame = True
         self._frame = None
 
-        # pose stability state
-        self.last_pose_vec = None           # previous pose vector
-        self.last_pose_change_ts = None     # last time pose was considered "changed"
-        self.pose_stable_triggered = False  # whether gesture already triggered
+        # --- pose stability state (for the active target only) ---
+        self.filtered_pose_vec = None   # EMA-filtered pose of active target
+        self.last_pose_vec = None       # reference pose for diff
+        self.pose_stable_time = 0.0     # accumulated stable time (sec)
+        self.pose_stable_triggered = False
 
         # tuning parameters
-        self.pose_eps = 0.02               # allowed pose change (L2 norm in normalized coords)
-        self.pose_stable_sec = 5.0         # seconds of stability required
+        self.pose_alpha = 0.2           # EMA coefficient (0.1~0.3 추천)
+        self.pose_eps = 0.03            # allowed pose change (L2 norm)
+        self.pose_stable_sec = 5.0      # required stability time (sec)
+
+        # --- single active target tracking ---
+        self.active_bbox = None         # [ymin, xmin, ymax, xmax] of selected person
+        self.target_lost_frames = 0     # how many frames we did not see the target
+        self.max_lost_frames = 15       # after this, drop target (~0.5sec at 30fps)
+
+        # time tracking for dt
+        self.last_ts = None
 
         if not os.path.exists(self.c_program_path):
             print(f"[ERROR] C program not found at: {self.c_program_path}")
@@ -82,7 +122,7 @@ class user_app_callback_class(app_callback_class):
 
 
 # -----------------------------------------------------------------------------------------------
-# Main callback function called by the GStreamerPoseEstimationApp
+# Main callback function
 # -----------------------------------------------------------------------------------------------
 def app_callback(pad, info, user_data):
     # Get the GstBuffer from the probe info
@@ -116,75 +156,154 @@ def app_callback(pad, info, user_data):
     keypoints = get_keypoints()
 
     # -------------------------------------------------------------------------------------------
-    # 1) Select target person (highest confidence)
+    # 1) Collect all persons in this frame
+    #    persons = [(bbox_list, confidence, pose_vec), ...]
     # -------------------------------------------------------------------------------------------
-    target_bbox = None
-    max_confidence = 0.0
-    target_pose_vec = None
+    persons = []
 
     for detection in detections:
         label = detection.get_label()
+        if label != "person":
+            continue
+
         bbox = detection.get_bbox()
         confidence = detection.get_confidence()
 
-        if label == "person" and confidence > max_confidence:
-            max_confidence = confidence
-            # Save bbox as [ymin, xmin, ymax, xmax] in normalized coordinates
-            target_bbox = [bbox.ymin(), bbox.xmin(), bbox.ymax(), bbox.xmax()]
+        ymin = bbox.ymin()
+        xmin = bbox.xmin()
+        ymax = bbox.ymax()
+        xmax = bbox.xmax()
 
-            # landmarks for pose vector
-            landmarks = detection.get_objects_typed(hailo.HAILO_LANDMARKS)
-            if landmarks:
-                points = landmarks[0].get_points()
-                target_pose_vec = pose_to_vector(points)
-
-        # Visualization of landmarks (eyes)
+        pose_vec = None
         landmarks = detection.get_objects_typed(hailo.HAILO_LANDMARKS)
-        if landmarks and frame is not None:
+        if landmarks:
             points = landmarks[0].get_points()
-            for eye in ["left_eye", "right_eye"]:
-                keypoint_index = keypoints[eye]
-                point = points[keypoint_index]
-                x = int((point.x() * bbox.width() + bbox.xmin()) * width)
-                y = int((point.y() * bbox.height() + bbox.ymin()) * height)
-                cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+            pose_vec = pose_to_vector(points)
+
+            # Visualization of eyes
+            if frame is not None:
+                for eye in ["left_eye", "right_eye"]:
+                    keypoint_index = keypoints[eye]
+                    point = points[keypoint_index]
+                    x = int((point.x() * bbox.width() + bbox.xmin()) * width)
+                    y = int((point.y() * bbox.height() + bbox.ymin()) * height)
+                    cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+
+        persons.append(([ymin, xmin, ymax, xmax], confidence, pose_vec))
 
     # -------------------------------------------------------------------------------------------
-    # Pose stability check: if pose does not change for N seconds -> trigger gesture once
+    # 2) Single active target selection (IoU-based tracking)
+    # -------------------------------------------------------------------------------------------
+    target_bbox = None
+    target_pose_vec = None
+
+    if not persons:
+        # No persons at all in this frame
+        user_data.target_lost_frames += 1
+        if user_data.target_lost_frames > user_data.max_lost_frames:
+            user_data.active_bbox = None
+
+        # reset pose stability
+        user_data.filtered_pose_vec = None
+        user_data.last_pose_vec = None
+        user_data.pose_stable_time = 0.0
+        user_data.pose_stable_triggered = False
+
+    else:
+        # If no active target yet -> choose person closest to center
+        if user_data.active_bbox is None:
+            def center_dist(bbox_list):
+                ymin, xmin, ymax, xmax = bbox_list
+                cx = (xmin + xmax) * 0.5
+                cy = (ymin + ymax) * 0.5
+                return (cx - 0.5) ** 2 + (cy - 0.5) ** 2
+
+            persons.sort(key=lambda p: center_dist(p[0]))
+            user_data.active_bbox = persons[0][0]
+            user_data.target_lost_frames = 0
+
+        # Find the detection that best matches the active_bbox (IoU)
+        best_iou = 0.0
+        best_person = None
+        for bbox_list, conf, pose_vec in persons:
+            iou = bbox_iou(user_data.active_bbox, bbox_list)
+            if iou > best_iou:
+                best_iou = iou
+                best_person = (bbox_list, conf, pose_vec)
+
+        if best_iou < 0.3:
+            # assume we lost the target
+            user_data.target_lost_frames += 1
+            if user_data.target_lost_frames > user_data.max_lost_frames:
+                user_data.active_bbox = None
+            target_bbox = None
+            target_pose_vec = None
+        else:
+            # same person as previous target
+            user_data.active_bbox = best_person[0]
+            target_bbox = best_person[0]
+            target_pose_vec = best_person[2]
+            user_data.target_lost_frames = 0
+
+    # -------------------------------------------------------------------------------------------
+    # 3) Pose stability check (for the active target only)
+    #    - EMA filtering + stable_time accumulation
     # -------------------------------------------------------------------------------------------
     now = time.time()
+    if user_data.last_ts is None:
+        dt = 0.0
+    else:
+        dt = now - user_data.last_ts
+    user_data.last_ts = now
+
+    if dt <= 0.0 or dt > 1.0:
+        # If timing is weird, assume ~30 FPS
+        dt = 1.0 / 30.0
 
     if target_pose_vec is not None:
-        if user_data.last_pose_vec is None:
-            # First pose seen
-            user_data.last_pose_vec = target_pose_vec
-            user_data.last_pose_change_ts = now
+        # 1) EMA filter update
+        if user_data.filtered_pose_vec is None:
+            user_data.filtered_pose_vec = target_pose_vec.copy()
+            user_data.last_pose_vec = user_data.filtered_pose_vec.copy()
+            user_data.pose_stable_time = 0.0
             user_data.pose_stable_triggered = False
         else:
-            diff = np.linalg.norm(target_pose_vec - user_data.last_pose_vec)
+            alpha = user_data.pose_alpha
+            user_data.filtered_pose_vec = (
+                alpha * target_pose_vec
+                + (1.0 - alpha) * user_data.filtered_pose_vec
+            )
 
-            if diff > user_data.pose_eps:
-                # Pose changed significantly -> reset timer
-                user_data.last_pose_vec = target_pose_vec
-                user_data.last_pose_change_ts = now
-                user_data.pose_stable_triggered = False
-            else:
-                # Pose almost the same
-                if (
-                    not user_data.pose_stable_triggered
-                    and user_data.last_pose_change_ts is not None
-                    and (now - user_data.last_pose_change_ts) >= user_data.pose_stable_sec
-                ):
-                    on_pose_stable(user_data, frame, target_pose_vec)
-                    user_data.pose_stable_triggered = True
+        # 2) diff between filtered pose and reference pose
+        diff = np.linalg.norm(user_data.filtered_pose_vec - user_data.last_pose_vec)
+
+        if diff < user_data.pose_eps:
+            # almost no movement -> accumulate stable time
+            user_data.pose_stable_time += dt
+        else:
+            # some movement -> decrease stable time gradually, not reset to zero
+            user_data.pose_stable_time = max(
+                0.0, user_data.pose_stable_time - dt * 0.5
+            )
+            user_data.last_pose_vec = user_data.filtered_pose_vec.copy()
+            user_data.pose_stable_triggered = False
+
+        # 3) trigger gesture once when stable enough
+        if (
+            not user_data.pose_stable_triggered
+            and user_data.pose_stable_time >= user_data.pose_stable_sec
+        ):
+            on_pose_stable(user_data, frame, user_data.filtered_pose_vec)
+            user_data.pose_stable_triggered = True
     else:
-        # No valid person/pose -> reset state
+        # No valid pose -> reset stability state
+        user_data.filtered_pose_vec = None
         user_data.last_pose_vec = None
-        user_data.last_pose_change_ts = None
+        user_data.pose_stable_time = 0.0
         user_data.pose_stable_triggered = False
 
     # -------------------------------------------------------------------------------------------
-    # 2) Call C program to control the gimbal (tracking)
+    # 4) Call C program to control the gimbal
     # -------------------------------------------------------------------------------------------
     # 형식:
     #   - 사람이 있음  -> ./siyi_gimbal ymin xmin ymax xmax
@@ -200,13 +319,34 @@ def app_callback(pad, info, user_data):
         print(f"[Error] Failed to run C program: {e}")
 
     # -------------------------------------------------------------------------------------------
-    # 3) Draw center lines and set frame back to user_data for UI
+    # 5) Draw center lines and set frame back to user_data for UI
     # -------------------------------------------------------------------------------------------
     if frame is not None:
         # Draw center crosshair
         if width and height:
-            cv2.line(frame, (width // 2, 0), (width // 2, height), (0, 0, 255), 1)
-            cv2.line(frame, (0, height // 2), (width, height // 2), (0, 0, 255), 1)
+            cv2.line(
+                frame,
+                (width // 2, 0),
+                (width // 2, height),
+                (0, 0, 255),
+                1,
+            )
+            cv2.line(
+                frame,
+                (0, height // 2),
+                (width, height // 2),
+                (0, 0, 255),
+                1,
+            )
+
+        # mark active target bbox (optional 시각화)
+        if target_bbox is not None:
+            ymin, xmin, ymax, xmax = target_bbox
+            x1 = int(xmin * width)
+            y1 = int(ymin * height)
+            x2 = int(xmax * width)
+            y2 = int(ymax * height)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
 
         # Hailo 예제는 RGB 기준이 많아서 BGR로 변환해서 GUI에 넘김
         user_data.set_frame(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
