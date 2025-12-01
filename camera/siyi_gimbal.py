@@ -1,31 +1,25 @@
 import socket
 import struct
 import time
-import threading
 
 class SiyiGimbal:
     """
-    SIYI A8 Mini 짐벌을 제어하기 위한 클래스입니다.
-    UDP 프로토콜을 사용하여 짐벌의 회전 속도를 제어합니다.
+    SIYI A8 Mini 짐벌 제어 (C 코드 프로토콜 완벽 호환 버전)
     """
     def __init__(self, ip='192.168.144.25', port=37260, debug=False):
         self.ip = ip
         self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.debug = debug
+        self.seq = 0
         
-        # PID 제어 변수 (값 조절이 필요할 수 있음)
-        self.kp_x = 0.15  # Yaw(좌우) 반응 속도
-        self.kp_y = 0.15  # Pitch(상하) 반응 속도
-        
-        # 화면 중앙 오차 범위 (Deadzone) - 이 안에 있으면 안 움직임
-        self.deadzone = 0.05 # 화면 크기의 5%
+        # 제어 파라미터
+        self.kp_x = 0.5  # Yaw 반응 속도
+        self.kp_y = 0.5  # Pitch 반응 속도
+        self.deadzone = 0.05
 
-        print(f"[SIYI] Gimbal controller initialized. Target: {self.ip}:{self.port}")
-
-    def _append_crc16(self, data):
-        """SIYI SDK용 CRC16 체크섬 계산"""
-        crc = 0
+    def _crc16_cal(self, data, crc=0):
+        """SIYI SDK CRC16"""
         for byte in data:
             crc ^= byte
             for _ in range(8):
@@ -33,97 +27,94 @@ class SiyiGimbal:
                     crc = (crc >> 1) ^ 0xA001
                 else:
                     crc = (crc >> 1)
-        return struct.pack('<H', crc)
+        return crc
 
-    def send_speed(self, yaw_speed, pitch_speed):
-        """
-        짐벌 회전 속도 전송
-        yaw_speed: -100 ~ 100 (음수: 좌, 양수: 우)
-        pitch_speed: -100 ~ 100 (음수: 하, 양수: 상)
-        """
-        # 속도 범위 제한 (-100 ~ 100)
-        yaw_speed = max(-100, min(100, int(yaw_speed)))
-        pitch_speed = max(-100, min(100, int(pitch_speed)))
-
-        # SIYI SDK Protocol Packet Construction
-        # Header (2B) + Ctrl (1B) + DataLen (2B) + Seq (2B) + CmdID (1B) + Data (2B) + CRC (2B)
-        
+    def send_packet(self, cmd_id, data_bytes):
+        """패킷 생성 및 전송"""
         STX = b'\x55\x66'
-        CTRL = b'\x00' # Need ACK: 0 (No)
-        # Data Length: 2 bytes (Yaw speed) + 2 bytes (Pitch speed) = 4 bytes
-        DataLen = struct.pack('<H', 4) 
-        SEQ = struct.pack('<H', 0) # Sequence number (not critical for UDP speed control)
-        CMD_ID = b'\x0B' # Command ID for Gimbal Rotation
+        CTRL = b'\x01' # C코드와 동일하게 1 설정
         
-        # Payload: Yaw(int16) + Pitch(int16)
-        DATA = struct.pack('<h', yaw_speed) + struct.pack('<h', pitch_speed)
+        # 데이터 길이 (Data Length): 2 bytes, Little Endian
+        data_len = len(data_bytes)
+        DATA_LEN = struct.pack('<H', data_len)
         
-        packet_body = CTRL + DataLen + SEQ + CMD_ID + DATA
-        crc = self._append_crc16(packet_body)
+        # 시퀀스 (Sequence): C코드처럼 0으로 고정해도 되지만, 증가시켜도 무방
+        # self.seq += 1 
+        SEQ = struct.pack('<H', 0) # C코드와 똑같이 0으로 고정
         
-        final_packet = STX + packet_body + crc
+        CMD_ID = struct.pack('<B', cmd_id)
+        
+        # CRC 계산을 위한 앞부분
+        packet_without_crc = STX + CTRL + DATA_LEN + SEQ + CMD_ID + data_bytes
+        
+        # CRC 계산
+        crc_val = self._crc16_cal(packet_without_crc, 0)
+        CRC = struct.pack('<H', crc_val)
+        
+        final_packet = packet_without_crc + CRC
         
         try:
             self.sock.sendto(final_packet, (self.ip, self.port))
             if self.debug:
-                print(f"[SIYI] Sent Speed - Yaw: {yaw_speed}, Pitch: {pitch_speed}")
+                # 패킷 내용을 16진수로 출력 (C 코드 디버그와 비교 가능)
+                hex_str = " ".join([f"{b:02x}" for b in final_packet])
+                print(f"[TX] {hex_str}")
         except Exception as e:
-            print(f"[SIYI] Error sending packet: {e}")
+            print(f"[SIYI] Send Error: {e}")
 
-    def track_object(self, bbox, frame_width, frame_height):
+    def send_speed(self, yaw_speed, pitch_speed):
         """
-        BBox 정보를 받아 짐벌이 중앙을 향하도록 제어합니다.
-        bbox: [ymin, xmin, ymax, xmax] (Hailo 정규화 좌표 0.0~1.0) 
-              또는 [x, y, w, h] (픽셀 좌표) - 상황에 맞춰 자동 계산
+        짐벌 속도 제어
+        CMD_ID: 0x07 (GIMBAL_SPEED)
+        Payload: [Yaw(1byte)][Pitch(1byte)] -> Total 2 bytes (signed int8)
+        Range: -100 ~ 100
         """
-        if bbox is None:
-            # 대상이 없으면 정지
+        # 범위 제한 (-100 ~ 100)
+        yaw_speed = int(max(-100, min(100, yaw_speed)))
+        pitch_speed = int(max(-100, min(100, pitch_speed)))
+        
+        # [핵심 수정] C코드와 동일하게 'b' (signed char, 1byte) 사용
+        # 총 2바이트 페이로드 생성
+        data = struct.pack('<b', yaw_speed) + struct.pack('<b', pitch_speed)
+        
+        # 0x07 명령어로 전송
+        self.send_packet(0x07, data)
+
+    def track_object(self, bbox, w, h):
+        """객체 추적 로직"""
+        if not bbox:
             self.send_speed(0, 0)
             return
 
-        # Hailo BBox 포맷 처리 (보통 ymin, xmin, ymax, xmax 형태이며 0.0~1.0 정규화됨)
-        # 예제 코드의 bbox 포맷을 확인해야 하지만, 보통 정규화된 좌표로 가정합니다.
+        # Hailo BBox (0.0 ~ 1.0)
         ymin, xmin, ymax, xmax = bbox
+        cx = (xmin + xmax) / 2.0
+        cy = (ymin + ymax) / 2.0
         
-        # 1. BBox의 중심점 계산 (0.0 ~ 1.0)
-        center_x = (xmin + xmax) / 2.0
-        center_y = (ymin + ymax) / 2.0
+        # 중앙(0.5)에서의 오차
+        err_x = cx - 0.5
+        err_y = cy - 0.5
         
-        # 2. 화면 중앙(0.5, 0.5)과의 오차 계산
-        # 화면 중앙은 0.5입니다.
-        # 오차 = 목표값(0.5) - 현재값(center)
-        # SIYI 짐벌은 (오른쪽으로 가려면 양수, 위로 가려면 양수) -> 방향 체크 필요
+        if abs(err_x) < self.deadzone: err_x = 0
+        if abs(err_y) < self.deadzone: err_y = 0
         
-        error_x = center_x - 0.5
-        error_y = center_y - 0.5
-
-        # 3. PID (여기서는 P제어만 사용)로 속도 계산
-        # Deadzone 체크 (너무 작은 움직임은 무시해서 떨림 방지)
-        if abs(error_x) < self.deadzone: error_x = 0
-        if abs(error_y) < self.deadzone: error_y = 0
-
-        # 속도 계산 (P gain 곱하기)
-        # X축: 오차가 양수(오른쪽에 있음) -> 오른쪽으로 돌려야 함 -> 양수 속도
-        # Y축: 오차가 양수(아래에 있음) -> 아래로 내려야 함 -> 음수 속도 (SIYI Pitch는 위가 양수일 수 있음, 반대면 - 부호 변경)
+        # 속도 계산 (P 제어)
+        # 100을 곱해서 -100~100 범위로 만듦
+        # 방향이 반대면 - 부호를 붙이거나 떼세요
+        yaw_cmd = err_x * 100 * self.kp_x
+        pitch_cmd = -err_y * 100 * self.kp_y 
         
-        yaw_cmd = error_x * 100 * self.kp_x * 2 # -1.0~1.0 범위를 -100~100으로 매핑
-        pitch_cmd = -error_y * 100 * self.kp_y * 2 # Pitch는 방향 반대일 확률 높음
-
-        # 디버깅 출력
-        if self.debug and (yaw_cmd != 0 or pitch_cmd != 0):
-            print(f"BBox Center: ({center_x:.2f}, {center_y:.2f}) -> Error: ({error_x:.2f}, {error_y:.2f}) -> Cmd: ({int(yaw_cmd)}, {int(pitch_cmd)})")
-
         self.send_speed(yaw_cmd, pitch_cmd)
 
-# 테스트 코드 (이 파일을 직접 실행하면 짐벌이 조금씩 움직임)
+# 테스트: 직접 실행 시 짐벌이 움직여야 함
 if __name__ == "__main__":
-    gimbal = SiyiGimbal(debug=True)
-    print("Testing Gimbal connection...")
+    g = SiyiGimbal(debug=True)
+    print("Testing Gimbal Move (Right 15)...")
     
-    # 오른쪽으로 살짝 회전
-    gimbal.send_speed(10, 0)
-    time.sleep(1)
-    
-    # 정지
-    gimbal.send_speed(0, 0)
-    print("Test done.")
+    # 0.1초 간격으로 10번 전송 (UDP라 여러번 보내는 게 좋음)
+    for _ in range(10):
+        g.send_speed(15, 0) 
+        time.sleep(0.1)
+        
+    print("Stopping...")
+    g.send_speed(0, 0)
