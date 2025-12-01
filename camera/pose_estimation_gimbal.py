@@ -7,6 +7,7 @@ import numpy as np
 import cv2
 import hailo
 import subprocess
+import time  # ★ 추가
 
 from hailo_apps.hailo_app_python.core.common.buffer_utils import (
     get_caps_from_pad,
@@ -16,6 +17,35 @@ from hailo_apps.hailo_app_python.core.gstreamer.gstreamer_app import app_callbac
 from hailo_apps.hailo_app_python.apps.pose_estimation.pose_estimation_pipeline import (
     GStreamerPoseEstimationApp,
 )
+
+# -----------------------------------------------------------------------------------------------
+# Helper functions for pose handling
+# -----------------------------------------------------------------------------------------------
+def pose_to_vector(points):
+    """
+    Convert Hailo landmark points to a 1D numpy vector [x0, y0, x1, y1, ...].
+    """
+    coords = []
+    for p in points:
+        coords.append(p.x())
+        coords.append(p.y())
+    return np.array(coords, dtype=np.float32)
+
+
+def on_pose_stable(user_data, frame, pose_vec):
+    """
+    Called once when pose has been stable for user_data.pose_stable_sec seconds.
+    Here we trigger the gimbal gesture.
+    """
+    print("[POSE] Pose has been stable for %.1f seconds. Triggering gesture..." %
+          user_data.pose_stable_sec)
+
+    try:
+        # Call C program in "gesture" mode
+        subprocess.run([user_data.c_program_path, "gesture"], check=False)
+    except Exception as e:
+        print(f"[Error] Failed to run gesture: {e}")
+
 
 # -----------------------------------------------------------------------------------------------
 # User-defined class to be used in the callback function
@@ -30,6 +60,15 @@ class user_app_callback_class(app_callback_class):
         # Whether to get video frames from the buffer
         self.use_frame = True
         self._frame = None
+
+        # pose stability state
+        self.last_pose_vec = None           # previous pose vector
+        self.last_pose_change_ts = None     # last time pose was considered "changed"
+        self.pose_stable_triggered = False  # whether gesture already triggered
+
+        # tuning parameters
+        self.pose_eps = 0.02               # allowed pose change (L2 norm in normalized coords)
+        self.pose_stable_sec = 5.0         # seconds of stability required
 
         if not os.path.exists(self.c_program_path):
             print(f"[ERROR] C program not found at: {self.c_program_path}")
@@ -81,6 +120,7 @@ def app_callback(pad, info, user_data):
     # -------------------------------------------------------------------------------------------
     target_bbox = None
     max_confidence = 0.0
+    target_pose_vec = None
 
     for detection in detections:
         label = detection.get_label()
@@ -92,7 +132,13 @@ def app_callback(pad, info, user_data):
             # Save bbox as [ymin, xmin, ymax, xmax] in normalized coordinates
             target_bbox = [bbox.ymin(), bbox.xmin(), bbox.ymax(), bbox.xmax()]
 
-        # Visualization of landmarks (eyes) – same style as 네 원본
+            # landmarks for pose vector
+            landmarks = detection.get_objects_typed(hailo.HAILO_LANDMARKS)
+            if landmarks:
+                points = landmarks[0].get_points()
+                target_pose_vec = pose_to_vector(points)
+
+        # Visualization of landmarks (eyes)
         landmarks = detection.get_objects_typed(hailo.HAILO_LANDMARKS)
         if landmarks and frame is not None:
             points = landmarks[0].get_points()
@@ -104,7 +150,41 @@ def app_callback(pad, info, user_data):
                 cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
 
     # -------------------------------------------------------------------------------------------
-    # 2) Call C program to control the gimbal
+    # Pose stability check: if pose does not change for N seconds -> trigger gesture once
+    # -------------------------------------------------------------------------------------------
+    now = time.time()
+
+    if target_pose_vec is not None:
+        if user_data.last_pose_vec is None:
+            # First pose seen
+            user_data.last_pose_vec = target_pose_vec
+            user_data.last_pose_change_ts = now
+            user_data.pose_stable_triggered = False
+        else:
+            diff = np.linalg.norm(target_pose_vec - user_data.last_pose_vec)
+
+            if diff > user_data.pose_eps:
+                # Pose changed significantly -> reset timer
+                user_data.last_pose_vec = target_pose_vec
+                user_data.last_pose_change_ts = now
+                user_data.pose_stable_triggered = False
+            else:
+                # Pose almost the same
+                if (
+                    not user_data.pose_stable_triggered
+                    and user_data.last_pose_change_ts is not None
+                    and (now - user_data.last_pose_change_ts) >= user_data.pose_stable_sec
+                ):
+                    on_pose_stable(user_data, frame, target_pose_vec)
+                    user_data.pose_stable_triggered = True
+    else:
+        # No valid person/pose -> reset state
+        user_data.last_pose_vec = None
+        user_data.last_pose_change_ts = None
+        user_data.pose_stable_triggered = False
+
+    # -------------------------------------------------------------------------------------------
+    # 2) Call C program to control the gimbal (tracking)
     # -------------------------------------------------------------------------------------------
     # 형식:
     #   - 사람이 있음  -> ./siyi_gimbal ymin xmin ymax xmax

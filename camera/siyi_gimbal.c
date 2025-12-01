@@ -22,8 +22,8 @@
 
 // Control parameters
 #define DEADZONE    0.05f
-#define KP_X        0.5f
-#define KP_Y        0.5f
+#define KP_X        0.8f
+#define KP_Y        0.8f
 
 // CRC16-CCITT (poly = 0x1021, init = 0x0000, MSB-first)
 static uint16_t crc16_ccitt(const uint8_t *data, size_t len, uint16_t crc_init)
@@ -126,6 +126,30 @@ static void send_speed(int sockfd,
     printf("[SIYI] Speed command yaw=%d pitch=%d\n", yaw_speed, pitch_speed);
     send_siyi_packet(sockfd, addr, 0x07, data, 2);
 }
+// 위아래로 3번 까딱 (pitch 제스처)
+static void gimbal_gesture(int sockfd, struct sockaddr_in *addr)
+{
+    int up_speed   = 25;   // 위로 올릴 속도
+    int down_speed = -25;  // 아래로 내릴 속도
+    useconds_t dur = 250000; // 0.25초
+
+    for (int i = 0; i < 3; i++) {
+        // 위로
+        send_speed(sockfd, addr, 0, up_speed);
+        usleep(dur);
+
+        // 아래로
+        send_speed(sockfd, addr, 0, down_speed);
+        usleep(dur);
+    }
+
+    // 마지막에 살짝 중앙 쪽으로 복귀시키고 정지하고 싶으면:
+    send_speed(sockfd, addr, 0, 15);
+    usleep(150000);
+
+    // 완전 정지
+    send_speed(sockfd, addr, 0, 0);
+}
 
 int main(int argc, char *argv[])
 {
@@ -150,7 +174,12 @@ int main(int argc, char *argv[])
         close(sockfd);
         return 0;
     }
-
+    if (argc == 2 && strcmp(argv[1], "gesture") == 0) {
+        printf("[INFO] Running gimbal gesture (3x nod).\n");
+        gimbal_gesture(sockfd, &servaddr);
+        close(sockfd);
+        return 0;
+    }
     // Case 2: bbox mode (ymin, xmin, ymax, xmax)
     if (argc != 5) {
         fprintf(stderr,
