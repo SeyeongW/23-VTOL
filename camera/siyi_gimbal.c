@@ -126,25 +126,39 @@ static void send_speed(int sockfd,
     printf("[SIYI] Speed command yaw=%d pitch=%d\n", yaw_speed, pitch_speed);
     send_siyi_packet(sockfd, addr, 0x07, data, 2);
 }
-//(yaw 제스처)
+// (yaw 제스처) — 오른쪽 끝까지 -> 왼쪽 끝까지 왕복 2번
 static void gimbal_gesture(int sockfd, struct sockaddr_in *addr)
 {
-    int right_speed = 25;     // 오른쪽으로 돌릴 속도
-    int left_speed  = -25;    // 왼쪽으로 돌릴 속도
-    useconds_t dur  = 250000; // 0.25초
+    // 최대에 가깝게 돌리려면 속도는 100으로
+    int right_speed = 100;    // 오른쪽 최대 속도
+    int left_speed  = -100;   // 왼쪽 최대 속도
 
-    for (int i = 0; i < 3; i++) {
-        // 오른쪽
+    // 한 방향으로 돌리는 시간 (필요하면 여기만 조정)
+    useconds_t sweep_dur = 2000000; // 2.0초
+    useconds_t pause_dur = 300000;  // 정지 간 짧은 쉬는 시간(0.3초)
+
+    for (int i = 0; i < 2; i++) {  // 왕복 2번
+
+        // 1) 오른쪽으로 쭉
+        printf("[GESTURE] Sweep %d: RIGHT\n", i + 1);
         send_speed(sockfd, addr, right_speed, 0);
-        usleep(dur);
+        usleep(sweep_dur);          // 이 시간 동안 계속 회전
+        send_speed(sockfd, addr, 0, 0);   // STOP
+        usleep(pause_dur);
 
-        // 왼쪽
+        // 2) 왼쪽으로 쭉
+        printf("[GESTURE] Sweep %d: LEFT\n", i + 1);
         send_speed(sockfd, addr, left_speed, 0);
-        usleep(dur);
+        usleep(sweep_dur);
+        send_speed(sockfd, addr, 0, 0);   // STOP
+        usleep(pause_dur);
     }
 
+    // 마지막에 완전 정지 한 번 더
     send_speed(sockfd, addr, 0, 0);
+    printf("[GESTURE] Done.\n");
 }
+
 
 
 int main(int argc, char *argv[])
