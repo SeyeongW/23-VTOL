@@ -130,7 +130,7 @@ class user_app_callback_class(app_callback_class):
         # 이 스크립트(.py)가 있는 디렉토리 기준으로 절대경로 생성
         script_dir = Path(__file__).resolve().parent
         self.c_program_path = str(script_dir / "siyi_gimbal")      # 추적용 C
-        self.a8_program_path = str(script_dir / "A8miniControl")   # 제스처용 A8miniControl
+        self.a8_program_path = "/home/sw/A8mini-gimbal-camera-control/A8miniControl" # 제스처용 A8miniControl
 
         self.gesture_done = False   # 제스처는 1번만
 
